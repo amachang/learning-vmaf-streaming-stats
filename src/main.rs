@@ -1,4 +1,4 @@
-use std::{error::Error, path::{Path, PathBuf}, ffi::CString, ptr, mem::MaybeUninit, intrinsics::copy_nonoverlapping};
+use std::{fmt, error::Error, path::{Path, PathBuf}, ffi::CString, ptr, mem::MaybeUninit, intrinsics::copy_nonoverlapping};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
@@ -31,6 +31,43 @@ lazy_static! {
 struct Cli {
     #[arg()]
     input_video_path: PathBuf,
+
+    #[arg(long, default_value="28.0")]
+    crf: Crf,
+
+    #[arg(long, default_value_t=10)]
+    start_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Crf {
+    deci_crf: u16,
+}
+
+impl Crf {
+    fn round_to_crf(f: f64) -> Self {
+        Self { deci_crf: (f * 10f64).round() as u16 }
+    }
+}
+
+impl Into<f64> for &Crf {
+    fn into(self: Self) -> f64 {
+        self.deci_crf as f64 / 10f64
+    }
+}
+
+impl fmt::Display for Crf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let float: f64 = self.into();
+        write!(f, "{}", float)
+    }
+}
+
+impl From<&str> for Crf {
+    fn from(s: &str) -> Self {
+        // TODO too rough impl
+        Self::round_to_crf(s.parse::<f64>().unwrap())
+    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -53,9 +90,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut vmaf_ctx: *mut VmafContext = ptr::null_mut();
 
     gst::init()?;
-    let pipeline = prepare_pipeline(cli.input_video_path)?;
 
-    pipeline.seek(1.0, gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, gst::SeekType::Set, gst::ClockTime::from_seconds(0), gst::SeekType::Set, gst::ClockTime::from_seconds(60))?;
+    log::trace!("Start preparation for pipeline");
+    let pipeline = prepare_pipeline(cli.input_video_path, cli.crf)?;
+    log::trace!("Pipeline prepared");
+
+    pipeline.seek(1.0, gst::SeekFlags::FLUSH, gst::SeekType::Set, gst::ClockTime::from_seconds(cli.start_seconds), gst::SeekType::End, gst::ClockTime::from_seconds(0))?;
 
     pipeline.set_state(gst::State::Playing)?;
 
@@ -120,21 +160,36 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if sample_count >= VMAF_SCORE_INTERVAL {
             log::trace!("Flush scores");
-            // flushing
             unsafe {
+                // flushing
                 let r = vmaf_read_pictures(vmaf_ctx, ptr::null_mut(), ptr::null_mut(), 0);
                 assert_eq!(r, 0);
 
+                /*
                 for sample_index in 0..sample_count {
                     let mut score: f64 = 0.0f64;
                     let r = vmaf_score_at_index(vmaf_ctx, vmaf_model, &mut score as *mut f64, sample_index);
-                    stats.add(score);
                     assert_eq!(r, 0);
+                    stats.add(score);
                 }
+                */
 
-                let stddev = stats.stddev();
-                let stderr = stddev / (stats.len() as f64).sqrt();
-                log::info!("Vmaf: {} ± {} (stddev={}, stderr={})", stats.mean(), stderr * 1.96, stddev, stderr);
+                let mut score: f64 = 0.0f64;
+                let r = vmaf_score_pooled(vmaf_ctx, vmaf_model, VmafPoolingMethod::VMAF_POOL_METHOD_HARMONIC_MEAN, &mut score as *mut f64, 0, sample_count - 1);
+                assert_eq!(r, 0);
+                stats.add(score);
+
+                if 1 < stats.len() {
+                    let stddev = stats.stddev();
+                    let stderr = stddev / (stats.len() as f64).sqrt();
+                    // 1.96: 95% conf interval
+                    // 1.64: 90% conf interval
+                    let conf_interval = stderr * 1.64;
+                    log::info!("Vmaf: {} ± {} (samples={}, stddev={}, stderr={})", stats.mean(), conf_interval, stats.len(), stddev, stderr);
+                    if conf_interval < 0.5 {
+                        break;
+                    }
+                }
 
                 let r = vmaf_close(vmaf_ctx);
                 assert_eq!(r, 0);
@@ -208,7 +263,7 @@ fn copy_sample_data_to_vmaf_pic(sample: &gst::Sample, pic: &VmafPicture, width: 
     }
 }
 
-fn prepare_pipeline(path: impl AsRef<Path>) -> Result<gst::Pipeline, Box<dyn Error>> {
+fn prepare_pipeline(path: impl AsRef<Path>, crf: Crf) -> Result<gst::Pipeline, Box<dyn Error>> {
     let path = path.as_ref();
     let src_el = ELEMENT_FACTORY_FILESRC.create().name("src").property("location", path).build()?;
     let decoder_el = ELEMENT_FACTORY_DECODEBIN.create().name("decoder").property("force-sw-decoders", true).build()?;
@@ -217,22 +272,22 @@ fn prepare_pipeline(path: impl AsRef<Path>) -> Result<gst::Pipeline, Box<dyn Err
 
     let ref_queue_el = ELEMENT_FACTORY_QUEUE.create().name("ref_queue")
         .property("max-size-buffers", u32::MAX)
-        .property("max-size-bytes", 100_000_000u32)
+        .property("max-size-bytes", 1_000_000_000u32)
         .property("max-size-time", u64::MAX)
         .build()?;
     let ref_sink_el = ELEMENT_FACTORY_APPSINK.create().name("ref_sink").property("sync", false).build()?;
 
     let encoder_queue_el = ELEMENT_FACTORY_QUEUE.create().name("encoder_queue")
         .property("max-size-buffers", u32::MAX)
-        .property("max-size-bytes", 100_000_000u32)
+        .property("max-size-bytes", 1_000_000_000u32)
         .property("max-size-time", u64::MAX)
         .build()?;
-    let encoder_el = ELEMENT_FACTORY_X265ENC.create().name("encoder").property("option-string", "crf=51").build()?;
+    let encoder_el = ELEMENT_FACTORY_X265ENC.create().name("encoder").property("option-string", &format!("crf={}", crf)).build()?;
     let encoder_parser_el = ELEMENT_FACTORY_H265PARSE.create().name("encoder_parser").build()?;
     let dist_decoder_el = ELEMENT_FACTORY_AVDEC_H265.create().name("dist_decoder").build()?;
     let dist_queue_el = ELEMENT_FACTORY_QUEUE.create().name("dist_queue")
         .property("max-size-buffers", u32::MAX)
-        .property("max-size-bytes", 100_000_000u32)
+        .property("max-size-bytes", 1_000_000_000u32)
         .property("max-size-time", u64::MAX)
         .build()?;
     let dist_sink_el = ELEMENT_FACTORY_APPSINK.create().name("dist_sink").property("sync", false).build()?;
