@@ -1,0 +1,17 @@
+[package]
+name = "learning-vmaf-streaming-stats"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.4.6", features = ["derive"] }
+env_logger = "0.10.0"
+glib = "0.18.2"
+gstreamer = "0.21.1"
+gstreamer-app = "0.21.1"
+lazy_static = "1.4.0"
+libvmaf-sys = { path = "./libvmaf-sys" }
+log = "0.4.20"
+streaming-stats = "0.2.3"

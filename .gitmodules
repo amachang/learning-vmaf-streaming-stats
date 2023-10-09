@@ -1,0 +1,3 @@
+[submodule "libvmaf-sys"]
+	path = libvmaf-sys
+	url = git@github.com:amachang/libvmaf-sys.git
