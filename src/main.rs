@@ -205,19 +205,56 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn alloc_init_vmaf_pic(pic: &mut VmafPicture, sample: &gst::Sample) {
+    // See Also https://github.com/GStreamer/gst-plugins-base/blob/master/gst-libs/gst/video/video-format.c
+
     let buffer = sample.buffer().unwrap();
     let caps = sample.caps().unwrap();
     let info = gst_video::VideoInfo::from_caps(caps).unwrap();
     let format = info.format();
     let format_info = gst_video::VideoFormatInfo::from(format);
 
-    let width = info.width();
-    let height = info.height();
-    let depthes = format_info.depth();
-    let depth = depthes[0];
-    let n_planes = format_info.n_planes();
+    let width = info.width() as usize;
+    let height = info.height() as usize;
+    let depth = info.comp_depth(0);
 
-    let (vmaf_pixel_format, format_depth, format_n_planes) = match format {
+    let n_components = info.n_components();
+    let pixel_stride = depth.div_ceil(8) as usize;
+
+    if 1 < pixel_stride {
+        assert!(format_info.is_le(), "Multi bytes pixel format must be little endian: {}", format);
+    }
+    for shift in format_info.shift() {
+        assert_eq!(*shift, 0, "The formats have bit shift not supported: {}", format);
+    }
+
+    assert_eq!(format_info.bits(), depth, "In my understanding, in little endian format, bits must be the same as depth: {}", format);
+    assert_eq!(format_info.n_planes(), n_components, "Video format must be planar format: {}", format);
+
+    if format_info.is_yuv() {
+        assert_eq!(n_components, 3, "Yuv video format must have 3 planar components: {}", format);
+        assert_eq!(info.comp_depth(0), info.comp_depth(1), "Yuv must have all the same bit depth: {}", format);
+        assert_eq!(info.comp_depth(1), info.comp_depth(2), "Yuv must have all the same bit depth: {}", format);
+    } else if format_info.is_gray() {
+        assert_eq!(n_components, 1, "Gray video format must be single component: {}", format);
+    } else {
+        panic!("Video format must be gray or yuv: {}", format);
+    }
+
+    let map = buffer.map_readable().unwrap();
+    let src_all_data = map.as_slice();
+
+    let mut src_component_infos = Vec::new();
+
+    for component_index in 0..n_components {
+        let width = info.comp_width(component_index as u8) as usize;
+        let height = info.comp_height(component_index as u8) as usize;
+        let pixel_stride = info.comp_pstride(component_index as u8) as usize;
+        let offset = info.comp_offset(component_index as u8) as usize;
+        let stride = info.comp_stride(component_index as u8) as usize;
+        src_component_infos.push(ComponentInfo { width, height, pixel_stride, offset, stride });
+    }
+
+    let (vmaf_pixel_format, format_depth, format_n_components) = match format {
         gst_video::VideoFormat::Gray8 => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 8, 1),
         gst_video::VideoFormat::I420 => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8, 3),
         gst_video::VideoFormat::Y42b => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 8, 3),
@@ -232,73 +269,65 @@ fn alloc_init_vmaf_pic(pic: &mut VmafPicture, sample: &gst::Sample) {
         _ => panic!("Pixel format not supported: {}", format),
     };
     assert_eq!(format_depth, depth);
-    assert_eq!(format_n_planes, n_planes);
+    assert_eq!(format_n_components, n_components);
 
+    let src_video_info = VideoInfo { vmaf_pixel_format, width, height, depth };
+
+    alloc_init_vmaf_pic_impl(pic, src_all_data, src_video_info, src_component_infos);
+}
+
+struct VideoInfo {
+    vmaf_pixel_format: VmafPixelFormat,
+    width: usize,
+    height: usize,
+    depth: u32,
+}
+
+struct ComponentInfo {
+    width: usize,
+    height: usize,
+    pixel_stride: usize,
+    offset: usize,
+    stride: usize
+}
+
+fn alloc_init_vmaf_pic_impl(pic: &mut VmafPicture, src_all_data: &[u8], src_video_info: VideoInfo, src_component_infos: Vec<ComponentInfo>) {
     unsafe {
-        let r = vmaf_picture_alloc(pic as *mut VmafPicture, vmaf_pixel_format, depth, width, height);
+        let r = vmaf_picture_alloc(
+            pic as *mut VmafPicture,
+            src_video_info.vmaf_pixel_format,
+            src_video_info.depth,
+            src_video_info.width as u32,
+            src_video_info.height as u32,
+            );
         assert_eq!(r, 0);
     };
 
-    // See Also https://github.com/GStreamer/gst-plugins-base/blob/master/gst-libs/gst/video/video-format.c
+    let pixel_stride = pic.bpc.div_ceil(8) as usize;
 
-    let n_components = format_info.n_components();
-    let planes = format_info.plane();
-    let pixel_strides = format_info.pixel_stride();
-    let n_value_bytes = depth.div_ceil(8) as usize;
+    for (component_index, src_component_info) in src_component_infos.into_iter().enumerate() {
+        assert_eq!(src_component_info.pixel_stride, pixel_stride);
 
-    assert_eq!(depth, pic.bpc);
-
-    if 1 < n_value_bytes {
-        assert!(format_info.is_le(), "Multi bytes pixel format must be little endian: {}", format);
-    }
-    for shift in format_info.shift() {
-        assert_eq!(*shift, 0, "The formats have bit shift not supported: {}", format);
-    }
-
-    assert_eq!(format_info.bits(), depth, "In my understanding, in little endian format, bits must be the same as depth: {}", format);
-    assert_eq!(format_info.n_planes(), n_components, "Video format must be planar format: {}", format);
-    assert_eq!(planes.len(), n_planes as usize);
-    assert_eq!(n_planes, n_components);
-
-    if format_info.is_yuv() {
-        assert_eq!(n_planes, 3, "Yuv video format must have 3 planar components: {}", format);
-        assert_eq!((planes[0], planes[1], planes[2]), (0, 1, 2), "must be Y U V order: {}", format);
-        assert_eq!(depthes[0], depthes[1], "Yuv must have all the same bit depth: {}", format);
-        assert_eq!(depthes[1], depthes[2], "Yuv must have all the same bit depth: {}", format);
-    } else if format_info.is_gray() {
-        assert_eq!(n_planes, 1, "Gray video format must be single component: {}", format);
-        assert_eq!(planes[0], 0);
-    } else {
-        panic!("Video format must be gray or yuv: {}", format);
-    }
-
-    let map = buffer.map_readable().unwrap();
-    let src_all_data = map.as_slice();
-
-    for component_index in 0..n_components {
         let component_index = component_index as usize;
-        let component_width = format_info.scale_width(component_index as u8, width) as usize;
-        let component_height = format_info.scale_width(component_index as u8, height) as usize;
+        let component_width = src_component_info.width;
+        let component_height = src_component_info.height;
 
         assert_eq!(pic.w[component_index] as usize, component_width);
         assert_eq!(pic.h[component_index] as usize, component_height);
 
-        let src_pixel_stride = pixel_strides[component_index] as usize;
-        let src_offset = info.comp_offset(component_index as u8) as usize;
-        let src_stride = info.comp_stride(component_index as u8) as usize;
-        assert_eq!(src_pixel_stride, n_value_bytes, "Pixel stride must be depth.div_ceil(8): {}", format);
+        let src_stride = src_component_info.stride;
         assert!(component_width <= src_stride);
 
         let dst_stride = pic.stride[component_index] as usize;
         assert!(component_width <= dst_stride);
 
-        let src_data = &src_all_data[src_offset] as *const u8;
+        let src_data = &src_all_data[src_component_info.offset] as *const u8;
         let dst_data = pic.data[component_index] as *mut u8;
 
         for y in 0..component_height {
-            let n_copy_bytes = n_value_bytes * component_width as usize;
-            let src_offset = y * (src_stride * n_value_bytes) as usize;
-            let dst_offset = y * (dst_stride * n_value_bytes) as usize;
+            let n_copy_bytes =  component_width * pixel_stride;
+            let src_offset = y * src_stride * pixel_stride;
+            let dst_offset = y * dst_stride * pixel_stride;
             unsafe {
                 /*
                 log::trace!("Start copy src={:?} dst={:?} bytes={:}",
