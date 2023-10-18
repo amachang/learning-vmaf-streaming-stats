@@ -1,6 +1,7 @@
 use std::{fmt, error::Error, path::{Path, PathBuf}, ffi::CString, ptr, mem::MaybeUninit, intrinsics::copy_nonoverlapping};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use gst::prelude::*;
 use glib;
 use clap::Parser;
@@ -120,32 +121,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         let Ok(dist_sample) = dist_sink.pull_sample() else {
             break;
         };
+        
+        let ref_buffer = ref_sample.buffer().unwrap();
+        let dist_buffer = dist_sample.buffer().unwrap();
 
-        let (ref_pts, ref_width, ref_height, ref_vmaf_pixel_format, ref_pixel_depth) = metadata_for_sample(&ref_sample);
-        let (dist_pts, dist_width, dist_height, dist_vmaf_pixel_format, dist_pixel_depth) = metadata_for_sample(&dist_sample);
-
-        let pts_diff = dist_pts - ref_pts;
+        let pts_diff = dist_buffer.pts().unwrap() - ref_buffer.pts().unwrap();
         if let Some(previous_pts_diff) = previous_pts_diff {
             assert_eq!(pts_diff, previous_pts_diff);
-        };
+        }
         previous_pts_diff = Some(pts_diff);
 
-        assert_eq!(ref_width, dist_width);
-        assert_eq!(ref_height, dist_height);
-        assert_eq!(ref_vmaf_pixel_format, dist_vmaf_pixel_format);
-        assert_eq!(ref_pixel_depth, dist_pixel_depth);
-
         let mut ref_pic: VmafPicture = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut dist_pic: VmafPicture = unsafe { MaybeUninit::zeroed().assume_init() };
-        unsafe {
-            let r = vmaf_picture_alloc(&mut ref_pic as *mut VmafPicture, ref_vmaf_pixel_format, ref_pixel_depth as u32, ref_width as u32, ref_height as u32);
-            assert_eq!(r, 0);
-            let r = vmaf_picture_alloc(&mut dist_pic as *mut VmafPicture, dist_vmaf_pixel_format, dist_pixel_depth as u32, dist_width as u32, dist_height as u32);
-            assert_eq!(r, 0);
-        };
+        alloc_init_vmaf_pic(&mut ref_pic, &ref_buffer);
 
-        copy_sample_data_to_vmaf_pic(&ref_sample, &ref_pic, ref_width, ref_height, ref_vmaf_pixel_format, ref_pixel_depth);
-        copy_sample_data_to_vmaf_pic(&dist_sample, &dist_pic, dist_width, dist_height, dist_vmaf_pixel_format, dist_pixel_depth);
+        let mut dist_pic: VmafPicture = unsafe { MaybeUninit::zeroed().assume_init() };
+        alloc_init_vmaf_pic(&mut dist_pic, &dist_buffer);
 
         unsafe {
             log::trace!("Read pictures");
@@ -214,54 +204,111 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn copy_sample_data_to_vmaf_pic(sample: &gst::Sample, pic: &VmafPicture, width: usize, height: usize, vmaf_pixel_format: VmafPixelFormat, pixel_depth: u8) {
-    let resolution = width * height;
+fn alloc_init_vmaf_pic(pic: &mut VmafPicture, buffer: &gst::BufferRef) {
+    let meta = buffer.meta::<gst_video::VideoMeta>().unwrap();
+    let format = meta.format();
+    let format_info = gst_video::VideoFormatInfo::from(format);
 
-    let buffer = sample.buffer().unwrap();
-    let map = buffer.map_readable().unwrap();
-    let data = map.as_slice();
+    let width = meta.width();
+    let height = meta.height();
+    let depthes = format_info.depth();
+    let depth = depthes[0];
 
-    let (y_pixel_count, u_pixel_count, v_pixel_count) = match vmaf_pixel_format {
-        VmafPixelFormat::VMAF_PIX_FMT_YUV400P => {
-            (resolution, 0, 0)
-        },
-        VmafPixelFormat::VMAF_PIX_FMT_YUV420P => {
-            assert_eq!(width % 2, 0);
-            assert_eq!(height % 2, 0);
-            assert_eq!(resolution % 4, 0);
-            (resolution, resolution / 4, resolution / 4)
-        },
-        VmafPixelFormat::VMAF_PIX_FMT_YUV422P => {
-            assert_eq!(width % 2, 0);
-            assert_eq!(resolution % 2, 0);
-            (resolution, resolution / 2, resolution / 2)
-        },
-        VmafPixelFormat::VMAF_PIX_FMT_YUV444P => {
-            (resolution, resolution, resolution)
-        },
-        VmafPixelFormat::VMAF_PIX_FMT_UNKNOWN => panic!("Pixel format unknown"),
+    let (vmaf_pixel_format, format_depth) = match format {
+        gst_video::VideoFormat::Gray8 => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 8),
+        gst_video::VideoFormat::I420 => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8),
+        gst_video::VideoFormat::Y42b => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 8),
+        gst_video::VideoFormat::Y444 => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 8),
+        gst_video::VideoFormat::I42010le => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 10),
+        gst_video::VideoFormat::I42210le => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 10),
+        gst_video::VideoFormat::Y44410le => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 10),
+        gst_video::VideoFormat::I42012le => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 12),
+        gst_video::VideoFormat::I42212le => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 12),
+        gst_video::VideoFormat::Y44412le => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 12),
+        gst_video::VideoFormat::Gray16Le => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 16),
+        _ => panic!("Pixel format not supported: {}", format),
     };
-
-    let y_bit_len = y_pixel_count * pixel_depth as usize;
-    let u_bit_len = u_pixel_count * pixel_depth as usize;
-    let v_bit_len = v_pixel_count * pixel_depth as usize;
-
-    let y_data_len = y_bit_len / 8 + if y_bit_len % 8 == 0 { 0 } else { 1 };
-    let u_data_len = u_bit_len / 8 + if u_bit_len % 8 == 0 { 0 } else { 1 };
-    let v_data_len = v_bit_len / 8 + if v_bit_len % 8 == 0 { 0 } else { 1 };
-
-    assert_eq!(data.len(), (y_data_len + u_data_len + v_data_len) as usize);
-
-    let y_data = &data[0 .. y_data_len];
-    let u_data = &data[y_data_len .. y_data_len+u_data_len];
-    let v_data = &data[y_data_len+u_data_len .. y_data_len+u_data_len+v_data_len];
+    assert_eq!(format_depth, depth);
 
     unsafe {
-        copy_nonoverlapping(y_data.as_ptr() as *const _, pic.data[0], y_data.len());
-        copy_nonoverlapping(u_data.as_ptr() as *const _, pic.data[1], u_data.len());
-        copy_nonoverlapping(v_data.as_ptr() as *const _, pic.data[2], v_data.len());
+        let r = vmaf_picture_alloc(pic as *mut VmafPicture, vmaf_pixel_format, depth, width, height);
+        assert_eq!(r, 0);
+    };
+
+    // See Also https://github.com/GStreamer/gst-plugins-base/blob/master/gst-libs/gst/video/video-format.c
+
+    let offsets = meta.offset();
+    let strides = meta.stride();
+
+    let n_planes = format_info.n_planes();
+    let n_components = format_info.n_components();
+    let planes = format_info.plane();
+    let pixel_strides = format_info.pixel_stride();
+    let n_value_bytes = depth.div_ceil(8) as usize;
+
+    assert_eq!(depth, pic.bpc);
+
+    if 1 < n_value_bytes {
+        assert!(format_info.is_le(), "Multi bytes pixel format must be little endian: {}", format);
+    }
+    for shift in format_info.shift() {
+        assert_eq!(*shift, 0, "The formats have bit shift not supported: {}", format);
+    }
+
+    assert_eq!(format_info.bits(), depth, "In my understanding, in little endian format, bits must be the same as depth: {}", format);
+    assert_eq!(format_info.n_planes(), n_components, "Video format must be planar format: {}", format);
+    assert_eq!(planes.len(), n_planes as usize);
+    assert_eq!(n_planes, n_components);
+
+    if format_info.is_yuv() {
+        assert_eq!(n_planes, 3, "Yuv video format must have 3 planar components: {}", format);
+        assert_eq!((planes[0], planes[1], planes[2]), (0, 1, 2), "must be Y U V order: {}", format);
+        assert_eq!(depthes[0], depthes[1], "Yuv must have all the same bit depth: {}", format);
+        assert_eq!(depthes[1], depthes[2], "Yuv must have all the same bit depth: {}", format);
+    } else if format_info.is_gray() {
+        assert_eq!(n_planes, 1, "Gray video format must be single component: {}", format);
+        assert_eq!(planes[0], 0);
+    } else {
+        panic!("Video format must be gray or yuv: {}", format);
+    }
+
+    let map = buffer.map_readable().unwrap();
+    let src_all_data = map.as_slice();
+
+    for component_index in 0..n_components {
+        let component_index = component_index as usize;
+        let component_width = format_info.scale_width(component_index as u8, width) as usize;
+        let component_height = format_info.scale_width(component_index as u8, height) as usize;
+
+        assert_eq!(pic.w[component_index] as usize, component_width);
+        assert_eq!(pic.h[component_index] as usize, component_height);
+
+        let src_offset = offsets[component_index] as usize;
+        let src_pixel_stride = pixel_strides[component_index] as usize;
+        let src_stride = strides[component_index] as usize;
+        assert_eq!(src_pixel_stride, n_value_bytes, "Pixel stride must be depth.div_ceil(8): {}", format);
+        assert!(component_width < src_stride);
+
+        let dst_stride = pic.stride[component_index] as usize;
+        assert!(component_width < dst_stride);
+
+        let src_data = src_all_data[src_offset] as *const u8;
+        let dst_data = pic.data[component_index] as *mut u8;
+
+        for y in 0..component_height {
+            let n_copy_bytes = n_value_bytes * component_width as usize;
+            let src_offset = y * (src_stride * n_value_bytes) as usize;
+            let dst_offset = y * (dst_stride * n_value_bytes) as usize;
+            unsafe {
+                copy_nonoverlapping(
+                    src_data.wrapping_add(src_offset),
+                    dst_data.wrapping_add(dst_offset),
+                    n_copy_bytes);
+            };
+        }
     }
 }
+
 
 fn prepare_pipeline(path: impl AsRef<Path>, crf: Crf) -> Result<gst::Pipeline, Box<dyn Error>> {
     let path = path.as_ref();
@@ -345,40 +392,5 @@ fn prepare_pipeline(path: impl AsRef<Path>, crf: Crf) -> Result<gst::Pipeline, B
     assert!(decoder_target_sink_pad.is_linked());
 
     Ok(pipeline)
-}
-
-fn metadata_for_sample(sample: &gst::Sample) -> (gst::ClockTime, usize, usize, VmafPixelFormat, u8) {
-    let buffer = sample.buffer().unwrap();
-    let pts = buffer.pts().unwrap();
-
-    let caps = sample.caps().unwrap();
-    for structure in caps.iter() {
-        if structure.name_quark() != *QUARK_STRUCTURE_NAME_VIDEO {
-            continue;
-        };
-
-        let format = structure.get::<&str>("format").unwrap();
-        let width = structure.get::<i32>("width").unwrap() as usize;
-        let height = structure.get::<i32>("height").unwrap() as usize;
-
-        let (vmaf_pixel_format, pixel_depth) = vmaf_pixel_format_info(format);
-
-        return (pts, width, height, vmaf_pixel_format, pixel_depth);
-    }
-    panic!("Pixel format not supported");
-}
-
-fn vmaf_pixel_format_info(format: &str) -> (VmafPixelFormat, u8) {
-    match format {
-        "I420" => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8),
-        "NV12" => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8),
-        "YV12" => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8),
-        "Y42B" => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 8),
-        "Y444" => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 8),
-        "I420_10LE" => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 10),
-        "I422_10LE" => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 10),
-        "Y444_10LE" => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 10),
-        _ => panic!("Pixel format not supported"),
-    }
 }
 

@@ -11,6 +11,7 @@ env_logger = "0.10.0"
 glib = "0.18.2"
 gstreamer = "0.21.1"
 gstreamer-app = "0.21.1"
+gstreamer-video = { version = "0.21.1" }
 lazy_static = "1.4.0"
 libvmaf-sys = { path = "./libvmaf-sys" }
 log = "0.4.20"
