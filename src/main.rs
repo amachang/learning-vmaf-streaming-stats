@@ -116,12 +116,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut previous_pts_diff = None;
     while !ref_sink.is_eos() && !dist_sink.is_eos() {
         let Ok(ref_sample) = ref_sink.pull_sample() else {
-            break;
+            continue;
         };
         let Ok(dist_sample) = dist_sink.pull_sample() else {
-            break;
+            continue;
         };
-        
+       
         let ref_buffer = ref_sample.buffer().unwrap();
         let dist_buffer = dist_sample.buffer().unwrap();
 
@@ -132,10 +132,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         previous_pts_diff = Some(pts_diff);
 
         let mut ref_pic: VmafPicture = unsafe { MaybeUninit::zeroed().assume_init() };
-        alloc_init_vmaf_pic(&mut ref_pic, &ref_buffer);
+        alloc_init_vmaf_pic(&mut ref_pic, &ref_sample);
 
         let mut dist_pic: VmafPicture = unsafe { MaybeUninit::zeroed().assume_init() };
-        alloc_init_vmaf_pic(&mut dist_pic, &dist_buffer);
+        alloc_init_vmaf_pic(&mut dist_pic, &dist_sample);
 
         unsafe {
             log::trace!("Read pictures");
@@ -204,31 +204,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn alloc_init_vmaf_pic(pic: &mut VmafPicture, buffer: &gst::BufferRef) {
-    let meta = buffer.meta::<gst_video::VideoMeta>().unwrap();
-    let format = meta.format();
+fn alloc_init_vmaf_pic(pic: &mut VmafPicture, sample: &gst::Sample) {
+    let buffer = sample.buffer().unwrap();
+    let caps = sample.caps().unwrap();
+    let info = gst_video::VideoInfo::from_caps(caps).unwrap();
+    let format = info.format();
     let format_info = gst_video::VideoFormatInfo::from(format);
 
-    let width = meta.width();
-    let height = meta.height();
+    let width = info.width();
+    let height = info.height();
     let depthes = format_info.depth();
     let depth = depthes[0];
+    let n_planes = format_info.n_planes();
 
-    let (vmaf_pixel_format, format_depth) = match format {
-        gst_video::VideoFormat::Gray8 => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 8),
-        gst_video::VideoFormat::I420 => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8),
-        gst_video::VideoFormat::Y42b => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 8),
-        gst_video::VideoFormat::Y444 => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 8),
-        gst_video::VideoFormat::I42010le => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 10),
-        gst_video::VideoFormat::I42210le => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 10),
-        gst_video::VideoFormat::Y44410le => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 10),
-        gst_video::VideoFormat::I42012le => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 12),
-        gst_video::VideoFormat::I42212le => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 12),
-        gst_video::VideoFormat::Y44412le => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 12),
-        gst_video::VideoFormat::Gray16Le => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 16),
+    let (vmaf_pixel_format, format_depth, format_n_planes) = match format {
+        gst_video::VideoFormat::Gray8 => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 8, 1),
+        gst_video::VideoFormat::I420 => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 8, 3),
+        gst_video::VideoFormat::Y42b => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 8, 3),
+        gst_video::VideoFormat::Y444 => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 8, 3),
+        gst_video::VideoFormat::I42010le => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 10, 3),
+        gst_video::VideoFormat::I42210le => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 10, 3),
+        gst_video::VideoFormat::Y44410le => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 10, 3),
+        gst_video::VideoFormat::I42012le => (VmafPixelFormat::VMAF_PIX_FMT_YUV420P, 12, 3),
+        gst_video::VideoFormat::I42212le => (VmafPixelFormat::VMAF_PIX_FMT_YUV422P, 12, 3),
+        gst_video::VideoFormat::Y44412le => (VmafPixelFormat::VMAF_PIX_FMT_YUV444P, 12, 3),
+        gst_video::VideoFormat::Gray16Le => (VmafPixelFormat::VMAF_PIX_FMT_YUV400P, 16, 1),
         _ => panic!("Pixel format not supported: {}", format),
     };
     assert_eq!(format_depth, depth);
+    assert_eq!(format_n_planes, n_planes);
 
     unsafe {
         let r = vmaf_picture_alloc(pic as *mut VmafPicture, vmaf_pixel_format, depth, width, height);
@@ -237,10 +241,6 @@ fn alloc_init_vmaf_pic(pic: &mut VmafPicture, buffer: &gst::BufferRef) {
 
     // See Also https://github.com/GStreamer/gst-plugins-base/blob/master/gst-libs/gst/video/video-format.c
 
-    let offsets = meta.offset();
-    let strides = meta.stride();
-
-    let n_planes = format_info.n_planes();
     let n_components = format_info.n_components();
     let planes = format_info.plane();
     let pixel_strides = format_info.pixel_stride();
@@ -283,16 +283,16 @@ fn alloc_init_vmaf_pic(pic: &mut VmafPicture, buffer: &gst::BufferRef) {
         assert_eq!(pic.w[component_index] as usize, component_width);
         assert_eq!(pic.h[component_index] as usize, component_height);
 
-        let src_offset = offsets[component_index] as usize;
         let src_pixel_stride = pixel_strides[component_index] as usize;
-        let src_stride = strides[component_index] as usize;
+        let src_offset = info.comp_offset(component_index as u8) as usize;
+        let src_stride = info.comp_stride(component_index as u8) as usize;
         assert_eq!(src_pixel_stride, n_value_bytes, "Pixel stride must be depth.div_ceil(8): {}", format);
-        assert!(component_width < src_stride);
+        assert!(component_width <= src_stride);
 
         let dst_stride = pic.stride[component_index] as usize;
-        assert!(component_width < dst_stride);
+        assert!(component_width <= dst_stride);
 
-        let src_data = src_all_data[src_offset] as *const u8;
+        let src_data = &src_all_data[src_offset] as *const u8;
         let dst_data = pic.data[component_index] as *mut u8;
 
         for y in 0..component_height {
@@ -300,6 +300,12 @@ fn alloc_init_vmaf_pic(pic: &mut VmafPicture, buffer: &gst::BufferRef) {
             let src_offset = y * (src_stride * n_value_bytes) as usize;
             let dst_offset = y * (dst_stride * n_value_bytes) as usize;
             unsafe {
+                /*
+                log::trace!("Start copy src={:?} dst={:?} bytes={:}",
+                    src_data.wrapping_add(src_offset),
+                    dst_data.wrapping_add(dst_offset),
+                    n_copy_bytes);
+                */
                 copy_nonoverlapping(
                     src_data.wrapping_add(src_offset),
                     dst_data.wrapping_add(dst_offset),
@@ -329,6 +335,7 @@ fn prepare_pipeline(path: impl AsRef<Path>, crf: Crf) -> Result<gst::Pipeline, B
         .property("max-size-bytes", 1_000_000_000u32)
         .property("max-size-time", u64::MAX)
         .build()?;
+
     let encoder_el = ELEMENT_FACTORY_X265ENC.create().name("encoder").property("option-string", &format!("crf={}", crf)).build()?;
     let encoder_parser_el = ELEMENT_FACTORY_H265PARSE.create().name("encoder_parser").build()?;
     let dist_decoder_el = ELEMENT_FACTORY_AVDEC_H265.create().name("dist_decoder").build()?;
